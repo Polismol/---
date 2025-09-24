@@ -1,0 +1,651 @@
+/**
+ * Google Apps Script to pull post metrics from the LiveDune API into a content plan sheet.
+ *
+ * Features:
+ *  - Custom menu "Статистика" → "Собрать показатели" with month shortcuts.
+ *  - Reads platform links (Telegram, VKontakte, Odnoklassniki) from the active sheet.
+ *  - Requests metrics from LiveDune by post URL and writes them back to the sheet.
+ *  - Calculates ER (engagement rate) for each platform.
+ *
+ * Usage:
+ *  1. Copy this file into the Apps Script editor that is bound to your Google Sheet.
+ *  2. Set the LiveDune API key in File → Project properties → Script properties with the key "LIVEDUNE_API_KEY".
+ *     (A placeholder token is bundled for development but should be replaced with your personal access_token.)
+ *  3. Adjust the column names in the PLATFORM_CONFIG object if your sheet uses different headers.
+ *  4. Reload the spreadsheet to trigger onOpen() and expose the custom menu.
+ */
+
+/** Sheet and column configuration */
+const STATISTICS_SHEET_NAME = 'Контент-план ТОС';
+const DATE_HEADER = 'Дата';
+
+/** LiveDune API configuration */
+const LIVEDUNE_BASE_URL = 'https://api.livedune.com/v1';
+const DEFAULT_LIVEDUNE_TOKEN = 'aa68777b612ce654.54205968';
+
+/** Platform column mapping and behaviour */
+const PLATFORM_CONFIG = {
+  telegram: {
+    network: 'telegram',
+    linkHeader: 'Ссылка TG',
+    columns: [
+      { metric: 'views', headerCandidates: ['просмотры', 'Просмотры TG', 'Просмотры'], offset: 1 },
+      { metric: 'interactions', headerCandidates: ['интеракции', 'Взаимодействия', 'Engagement'], offset: 2 },
+      { metric: 'er', headerCandidates: ['ER', 'ER TG', 'метрика ER'], offset: 3, transform: percentFormatter }
+    ],
+    erDenominator: ['views', 'reach']
+  },
+  vk: {
+    network: 'vkontakte',
+    linkHeader: 'Ссылка VK',
+    columns: [
+      { metric: 'reach', headerCandidates: ['охват', 'Охват', 'Reach'], offset: 1 },
+      { metric: 'interactions', headerCandidates: ['интеракции', 'Взаимодействия', 'Engagement'], offset: 2 },
+      { metric: 'er', headerCandidates: ['ER', 'ER VK', 'метрика ER'], offset: 3, transform: percentFormatter }
+    ],
+    erDenominator: ['reach', 'views']
+  },
+  ok: {
+    network: 'odnoklassniki',
+    linkHeader: 'Ссылка ОК',
+    columns: [
+      { metric: 'views', headerCandidates: ['просмотры', 'Просмотры ОК', 'Просмотры'], offset: 1 },
+      { metric: 'interactions', headerCandidates: ['интеракции', 'Взаимодействия', 'Engagement'], offset: 2 },
+      { metric: 'er', headerCandidates: ['ER', 'ER ОК', 'метрика ER'], offset: 3, transform: percentFormatter }
+    ],
+    erDenominator: ['views', 'reach']
+  }
+};
+
+/**
+ * Adds the custom menu on spreadsheet open.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  const menu = ui.createMenu('Статистика');
+  const monthMenu = ui.createMenu('Собрать показатели')
+    .addItem('Январь', 'collectStatsForJanuary')
+    .addItem('Февраль', 'collectStatsForFebruary')
+    .addItem('Март', 'collectStatsForMarch')
+    .addItem('Апрель', 'collectStatsForApril')
+    .addItem('Май', 'collectStatsForMay')
+    .addItem('Июнь', 'collectStatsForJune')
+    .addItem('Июль', 'collectStatsForJuly')
+    .addItem('Август', 'collectStatsForAugust')
+    .addItem('Сентябрь', 'collectStatsForSeptember')
+    .addItem('Октябрь', 'collectStatsForOctober')
+    .addItem('Ноябрь', 'collectStatsForNovember')
+    .addItem('Декабрь', 'collectStatsForDecember');
+
+  menu.addSubMenu(monthMenu)
+    .addSeparator()
+    .addItem('Выбранные строки', 'collectStatsForSelection')
+    .addItem('Текущий месяц', 'collectStatsForCurrentMonth')
+    .addItem('Все строки', 'collectStatsForAllRows')
+    .addToUi();
+}
+
+/** Month handlers */
+function collectStatsForJanuary() { collectStatsForMonth(1); }
+function collectStatsForFebruary() { collectStatsForMonth(2); }
+function collectStatsForMarch() { collectStatsForMonth(3); }
+function collectStatsForApril() { collectStatsForMonth(4); }
+function collectStatsForMay() { collectStatsForMonth(5); }
+function collectStatsForJune() { collectStatsForMonth(6); }
+function collectStatsForJuly() { collectStatsForMonth(7); }
+function collectStatsForAugust() { collectStatsForMonth(8); }
+function collectStatsForSeptember() { collectStatsForMonth(9); }
+function collectStatsForOctober() { collectStatsForMonth(10); }
+function collectStatsForNovember() { collectStatsForMonth(11); }
+function collectStatsForDecember() { collectStatsForMonth(12); }
+
+/** Additional menu handlers */
+function collectStatsForCurrentMonth() {
+  const today = new Date();
+  collectStatsForMonth(today.getMonth() + 1);
+}
+
+function collectStatsForAllRows() {
+  collectStatsForMonth(null);
+}
+
+function collectStatsForSelection() {
+  const sheet = getTargetSheet();
+  const range = sheet.getActiveRange();
+  if (!range) {
+    SpreadsheetApp.getUi().alert('Выделите хотя бы одну строку с данными.');
+    return;
+  }
+  const startRow = range.getRow();
+  const numRows = range.getNumRows();
+  processRows({ startRow, numRows });
+}
+
+/**
+ * Entry point for month-based processing.
+ *
+ * @param {number|null} monthNumber - 1-12 to filter by month, null to process all rows
+ */
+function collectStatsForMonth(monthNumber) {
+  processRows({ month: monthNumber });
+}
+
+/**
+ * Core row processing routine.
+ *
+ * @param {{month?: number|null, startRow?: number, numRows?: number}} options
+ */
+function processRows(options) {
+  const sheet = getTargetSheet();
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  if (values.length <= 1) {
+    SpreadsheetApp.getUi().alert('В таблице нет данных для обработки.');
+    return;
+  }
+
+  const headers = values[0];
+  const columnIndexCache = buildHeaderIndexMap(headers);
+  const dateIndex = resolveColumnIndex(headers, columnIndexCache, DATE_HEADER);
+  if (dateIndex == null) {
+    throw new Error(`Не найдена колонка с датой ("${DATE_HEADER}").`);
+  }
+
+  const firstDataRow = 1;
+  const startRow = options.startRow ? Math.max(options.startRow - 1, firstDataRow) : firstDataRow;
+  const endRow = options.numRows ? startRow + options.numRows - 1 : values.length - 1;
+  const monthFilter = options.month || null;
+
+  const updates = [];
+
+  for (let r = startRow; r <= endRow && r < values.length; r++) {
+    const row = values[r];
+    const rowDate = row[dateIndex];
+    const rowMonth = resolveMonth(rowDate);
+    if (monthFilter && rowMonth !== monthFilter) {
+      continue;
+    }
+
+    const rowNumber = r + 1; // 1-based for Apps Script API
+    const rowUpdates = handleRow(sheet, rowNumber, row, headers, columnIndexCache);
+    if (rowUpdates.length) {
+      updates.push(...rowUpdates);
+    }
+  }
+
+  if (!updates.length) {
+    Logger.log('Нет обновлений для указанных строк.');
+    return;
+  }
+
+  updates.forEach(update => {
+    const { range, values: rangeValues } = update;
+    range.setValues(rangeValues);
+  });
+
+  SpreadsheetApp.flush();
+}
+
+/**
+ * Processes a single row and returns an array of update descriptors.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {number} rowNumber
+ * @param {any[]} rowValues
+ * @param {any[]} headers
+ * @param {Object<string, number[]>} columnIndexCache
+ * @return {Array<{range: GoogleAppsScript.Spreadsheet.Range, values: any[][]}>}
+ */
+function handleRow(sheet, rowNumber, rowValues, headers, columnIndexCache) {
+  const updates = [];
+
+  Object.keys(PLATFORM_CONFIG).forEach(platformKey => {
+    const platform = PLATFORM_CONFIG[platformKey];
+    const linkIndex = resolveColumnIndex(headers, columnIndexCache, platform.linkHeader);
+    if (linkIndex == null) {
+      Logger.log(`Столбец ссылки для платформы ${platformKey} не найден.`);
+      return;
+    }
+
+    const link = rowValues[linkIndex];
+    if (!link || typeof link !== 'string') {
+      return;
+    }
+
+    try {
+      const metrics = fetchPlatformMetrics(platformKey, link);
+      const er = computeEngagementRate(metrics, platform.erDenominator);
+      metrics.er = er != null ? er : null;
+
+      const rowUpdate = buildRowUpdate(sheet, rowNumber, headers, columnIndexCache, platform, metrics, linkIndex);
+      if (rowUpdate) {
+        updates.push(rowUpdate);
+      }
+
+      Utilities.sleep(350); // gentle throttling to avoid hitting API limits
+    } catch (error) {
+      Logger.log(`Ошибка при обработке ${platformKey} (${link}): ${error}`);
+      const errorUpdate = buildRowUpdate(sheet, rowNumber, headers, columnIndexCache, platform, {
+        views: '',
+        reach: '',
+        interactions: '',
+        er: ''
+      }, linkIndex, String(error));
+      if (errorUpdate) {
+        updates.push(errorUpdate);
+      }
+    }
+  });
+
+  return updates;
+}
+
+/**
+ * Creates the range update for a single platform in the row.
+ */
+function buildRowUpdate(sheet, rowNumber, headers, columnIndexCache, platform, metrics, linkIndex, errorMessage) {
+  const outputValues = [];
+  const targetRanges = [];
+
+  platform.columns.forEach(column => {
+    const columnIndex = resolveMetricColumn(headers, columnIndexCache, column, linkIndex);
+    if (columnIndex == null) {
+      Logger.log(`Не удалось определить колонку для метрики ${column.metric} (${platform.linkHeader}).`);
+      return;
+    }
+
+    let value = metrics[column.metric];
+    if (typeof column.transform === 'function' && value != null && value !== '') {
+      value = column.transform(value);
+    }
+
+    if (errorMessage && column.metric === platform.columns[0].metric) {
+      value = `Ошибка: ${errorMessage}`;
+    }
+
+    outputValues.push({ columnIndex, value: sanitizeForSheet(value) });
+  });
+
+  if (!outputValues.length) {
+    return null;
+  }
+
+  outputValues.sort((a, b) => a.columnIndex - b.columnIndex);
+  const firstColumn = outputValues[0].columnIndex;
+  const lastColumn = outputValues[outputValues.length - 1].columnIndex;
+  const width = lastColumn - firstColumn + 1;
+  const rowArray = new Array(width).fill('');
+
+  outputValues.forEach(item => {
+    const offset = item.columnIndex - firstColumn;
+    rowArray[offset] = item.value;
+  });
+
+  const range = sheet.getRange(rowNumber, firstColumn + 1, 1, width);
+  return { range, values: [rowArray] };
+}
+
+/**
+ * Resolves a metric column index using header candidates or offsets.
+ */
+function resolveMetricColumn(headers, columnIndexCache, columnConfig, linkIndex) {
+  for (let i = 0; i < columnConfig.headerCandidates.length; i++) {
+    const header = columnConfig.headerCandidates[i];
+    const index = resolveColumnIndex(headers, columnIndexCache, header, linkIndex);
+    if (index != null) {
+      return index;
+    }
+  }
+
+  if (typeof columnConfig.offset === 'number' && linkIndex != null) {
+    const candidate = linkIndex + columnConfig.offset;
+    if (candidate >= 0 && candidate < headers.length) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Computes engagement rate based on available metrics.
+ */
+function computeEngagementRate(metrics, denominatorPreference) {
+  if (!metrics) {
+    return null;
+  }
+  const numerator = firstNumber(metrics.interactions, metrics.engagement, metrics.activity);
+  if (numerator == null || numerator === 0) {
+    return numerator === 0 ? 0 : null;
+  }
+
+  const denominators = Array.isArray(denominatorPreference) ? denominatorPreference : [denominatorPreference];
+  for (let i = 0; i < denominators.length; i++) {
+    const key = denominators[i];
+    const value = firstNumber(metrics[key]);
+    if (value && value > 0) {
+      return numerator / value;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Requests metrics for a specific platform and post URL.
+ */
+function fetchPlatformMetrics(platformKey, postUrl) {
+  const platform = PLATFORM_CONFIG[platformKey];
+  if (!platform) {
+    throw new Error(`Неизвестная платформа: ${platformKey}`);
+  }
+
+  const payload = {
+    url: postUrl,
+    network: platform.network
+  };
+
+  const response = callLiveDune('/posts/by-link', payload);
+  const stats = extractStatsObject(response);
+  const views = extractMetricValue(stats, VIEW_PATHS);
+  const reach = extractMetricValue(stats, REACH_PATHS);
+  const interactions = extractInteractions(stats);
+
+  return {
+    views: views != null ? views : reach,
+    reach: reach != null ? reach : views,
+    interactions: interactions
+  };
+}
+
+/**
+ * Performs the HTTP request against the LiveDune API.
+ */
+function callLiveDune(path, payload) {
+  const token = getLiveDuneAccessToken();
+  const attempts = buildLiveDuneRequestAttempts(path, token);
+  let lastError = null;
+
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const headers = Object.assign({
+      Accept: 'application/json',
+      'User-Agent': 'AppsScript-LiveDune-Connector/1.0'
+    }, attempt.headers || {});
+
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      headers,
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(attempt.url, options);
+    const status = response.getResponseCode();
+    const text = response.getContentText();
+
+    if (status >= 400) {
+      const message = text || '';
+      const needsRetry = (status === 401 || status === 403) && /access token/i.test(message);
+      if ((needsRetry || status === 404) && i < attempts.length - 1) {
+        lastError = `LiveDune API error ${status}: ${message}`;
+        continue;
+      }
+      throw new Error(`LiveDune API error ${status}: ${message}`);
+    }
+
+    if (!text) {
+      throw new Error('Пустой ответ от LiveDune.');
+    }
+
+    return parseLiveDuneJson(text);
+  }
+
+  throw new Error(lastError || 'LiveDune API не вернул данные.');
+}
+
+function buildLiveDuneRequestAttempts(path, token) {
+  const url = `${LIVEDUNE_BASE_URL}${path}`;
+  const encodedToken = encodeURIComponent(token);
+  return [
+    { url: `${url}?access_token=${encodedToken}` },
+    { url, headers: { 'X-Access-Token': token } },
+    { url, headers: { 'Access-Token': token } }
+  ];
+}
+
+function getLiveDuneAccessToken() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const stored = scriptProperties.getProperty('LIVEDUNE_API_KEY');
+  const token = (stored || DEFAULT_LIVEDUNE_TOKEN || '').trim();
+  if (!token) {
+    throw new Error('Не задан access_token LiveDune.');
+  }
+  return token;
+}
+
+function parseLiveDuneJson(text) {
+  if (!text) {
+    return {};
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Не удалось разобрать ответ LiveDune: ${text}`);
+  }
+}
+
+/**
+ * Extracts the statistics object from the LiveDune response, regardless of nesting.
+ */
+function extractStatsObject(response) {
+  if (!response || typeof response !== 'object') {
+    return {};
+  }
+
+  if (Array.isArray(response.data) && response.data.length) {
+    return response.data[0];
+  }
+
+  if (response.data && typeof response.data === 'object') {
+    return response.data;
+  }
+
+  if (response.statistics) {
+    return response.statistics;
+  }
+
+  return response;
+}
+
+const VIEW_PATHS = [
+  ['views'],
+  ['view'],
+  ['video', 'views'],
+  ['statistics', 'views'],
+  ['metrics', 'views'],
+  ['metrics', 'impressions'],
+  ['impressions'],
+  ['coverage'],
+  ['shows']
+];
+
+const REACH_PATHS = [
+  ['reach'],
+  ['metrics', 'reach'],
+  ['metrics', 'coverage'],
+  ['statistics', 'reach'],
+  ['coverage'],
+  ['unique_views']
+];
+
+const INTERACTION_FIELDS = [
+  'interactions',
+  'engagement',
+  'activity',
+  'clicks',
+  'likes',
+  'comments',
+  'shares',
+  'reposts',
+  'favorites',
+  'bookmarks',
+  'saves',
+  'answers',
+  'reactions',
+  'forwards'
+];
+
+/**
+ * Attempts to extract a numeric metric following different known paths.
+ */
+function extractMetricValue(obj, candidatePaths) {
+  for (let i = 0; i < candidatePaths.length; i++) {
+    const value = getValueByPath(obj, candidatePaths[i]);
+    if (isFiniteNumber(value)) {
+      return Number(value);
+    }
+  }
+  return null;
+}
+
+/**
+ * Sums up interaction-related fields to produce a total engagement metric.
+ */
+function extractInteractions(obj) {
+  const direct = extractMetricValue(obj, [
+    ['interactions'],
+    ['metrics', 'interactions'],
+    ['statistics', 'interactions'],
+    ['engagement'],
+    ['metrics', 'engagement']
+  ]);
+  if (direct != null) {
+    return direct;
+  }
+
+  let sum = 0;
+  let found = false;
+  INTERACTION_FIELDS.forEach(field => {
+    const value = getValueByPath(obj, field.split('.'));
+    if (isFiniteNumber(value)) {
+      sum += Number(value);
+      found = true;
+    }
+  });
+
+  return found ? sum : null;
+}
+
+/** Helper utilities */
+function getTargetSheet() {
+  const spreadsheet = SpreadsheetApp.getActive();
+  if (!spreadsheet) {
+    throw new Error('Нет активной таблицы Google Sheets.');
+  }
+
+  if (STATISTICS_SHEET_NAME) {
+    const namedSheet = spreadsheet.getSheetByName(STATISTICS_SHEET_NAME);
+    if (namedSheet) {
+      return namedSheet;
+    }
+  }
+
+  return spreadsheet.getActiveSheet();
+}
+
+function buildHeaderIndexMap(headers) {
+  const map = {};
+  headers.forEach((header, index) => {
+    if (!map[header]) {
+      map[header] = [];
+    }
+    map[header].push(index);
+  });
+  return map;
+}
+
+function resolveColumnIndex(headers, columnIndexCache, header, proximityTo) {
+  const indexes = columnIndexCache[header];
+  if (indexes && indexes.length) {
+    if (typeof proximityTo === 'number') {
+      let closest = indexes[0];
+      let distance = Math.abs(closest - proximityTo);
+      indexes.forEach(idx => {
+        const diff = Math.abs(idx - proximityTo);
+        if (diff < distance) {
+          closest = idx;
+          distance = diff;
+        }
+      });
+      return closest;
+    }
+    return indexes[0];
+  }
+  return null;
+}
+
+function resolveMonth(value) {
+  if (!value) {
+    return null;
+  }
+  if (value instanceof Date) {
+    return value.getMonth() + 1;
+  }
+  const parsed = new Date(value);
+  return isNaN(parsed) ? null : parsed.getMonth() + 1;
+}
+
+function getValueByPath(obj, path) {
+  if (!obj || typeof obj !== 'object') {
+    return null;
+  }
+  let current = obj;
+  for (let i = 0; i < path.length; i++) {
+    const key = path[i];
+    if (current == null) {
+      return null;
+    }
+    if (key in current) {
+      current = current[key];
+    } else {
+      return null;
+    }
+  }
+  return current;
+}
+
+function isFiniteNumber(value) {
+  return typeof value === 'number' && isFinite(value);
+}
+
+function firstNumber() {
+  for (let i = 0; i < arguments.length; i++) {
+    const value = arguments[i];
+    if (isFiniteNumber(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function percentFormatter(value) {
+  if (!isFiniteNumber(value)) {
+    return value;
+  }
+  return Math.round(value * 10000) / 100;
+}
+
+function sanitizeForSheet(value) {
+  if (value == null) {
+    return '';
+  }
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+  return value;
+}
